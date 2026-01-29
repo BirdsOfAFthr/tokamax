@@ -182,14 +182,13 @@ def flash_attention_kernel(
     # TODO: Support other out_dtypes.
     raise NotImplementedError(f"{out_dtype=} != {q.dtype=} unsupported.")
 
-  q_seq_len, num_q_heads, head_dim = q.shape
+  q_seq_len, num_q_heads, _ = q.shape
   dtype = q.dtype
 
   if q_seq_len % 8 != 0:
     raise NotImplementedError(f"{q_seq_len=} must be a multiple of 8")
 
-  kv_seq_len, num_kv_heads, _ = k.shape
-  orig_head_dim_out = v.shape[-1]
+  kv_seq_len, num_kv_heads, orig_head_dim_out = v.shape
   if kv_seq_len % config.block_kv:
     raise ValueError(f"{kv_seq_len=} must be a multiple of {config.block_kv=}")
   if num_q_heads % num_kv_heads:
@@ -200,10 +199,10 @@ def flash_attention_kernel(
         f"Only f16 and bf16 are supported, got dtype: {dtype}"
     )
 
-  # TODO: Handle different head_dims without padding.
-  head_dim = head_dim_out = pl.cdiv(max(head_dim, orig_head_dim_out), 64) * 64
-  pad_head_dim = lambda x: shape_lib.pad_dim_to(x, head_dim, -1)
+  pad_head_dim = lambda x: shape_lib.pad_to_next_multiple_of(x, 64, -1)
   q, k, v = map(pad_head_dim, (q, k, v))
+  head_dim = q.shape[-1]
+  head_dim_out = v.shape[-1]
 
   if mask is None:
     apply_bool_mask = bcast_mask_q = bcast_mask_k = False
@@ -221,7 +220,6 @@ def flash_attention_kernel(
   num_q_tiles = pl.cdiv(q_seq_len, tile_q)
   num_stages = config.num_stages
   num_tma_splits = config.num_tma_splits if head_dim >= 128 else 1
-  tma_chunk_size = head_dim // num_tma_splits
   collective = config.collective
   block_q = tile_q // 2 if collective else tile_q
   collective_axis = "x" if collective else None
@@ -230,7 +228,7 @@ def flash_attention_kernel(
   def kernel(*refs, scoped):
     smem_buffers, buffer_barriers = scoped
     (
-        q_smem,
+        (q_smem, o_smem),
         k_smem,
         v_smem,
         qk_tmem,
@@ -314,8 +312,8 @@ def flash_attention_kernel(
     ):
       kv_head = lax.div(hi, q_heads_per_kv_head)
       stage = lax.rem(ki - lb, num_stages)
-      tma_chunk = head_dim // num_tma_splits
-      ds = pl.ds(split_idx * tma_chunk, tma_chunk)
+      block_d = gmem_ref.shape[-1] // num_tma_splits
+      ds = pl.ds(split_idx * block_d, block_d)
       plgpu.copy_gmem_to_smem(
           gmem_ref.at[pl.ds(ki * block_kv, block_kv), kv_head, ds],
           smem_ref.at[stage, split_idx],
@@ -416,7 +414,8 @@ def flash_attention_kernel(
             @pl.loop(0, num_tma_splits)
             def _(split_idx):
               barrier_slot = stage * num_tma_splits + split_idx
-              ds = pl.ds(split_idx * tma_chunk_size, tma_chunk_size)
+              block_d = head_dim // num_tma_splits
+              ds = pl.ds(split_idx * block_d, block_d)
               with jax.named_scope("issuing Q@K.T"):
                 plgpu.tcgen05_mma(
                     acc_qk_tmem,
@@ -441,7 +440,8 @@ def flash_attention_kernel(
             @pl.loop(0, num_tma_splits)
             def _(split_idx):
               barrier_slot = stage * num_tma_splits + split_idx
-              ds = pl.ds(split_idx * tma_chunk_size, tma_chunk_size)
+              block_d = head_dim_out // num_tma_splits
+              ds = pl.ds(split_idx * block_d, block_d)
               plgpu.barrier_wait(out_scaled_barrier.at[split_idx])
               with jax.named_scope("issuing P@V"):
                 plgpu.tcgen05_mma(
@@ -658,9 +658,9 @@ def flash_attention_kernel(
       with jax.named_scope("SMEM -> GMEM"):
         if normalize_output:
           acc *= lax.broadcast_in_dim(1.0 / l_i, acc.shape, [0])
-        q_smem[...] = acc.astype(dtype)
+        o_smem[...] = acc.astype(dtype)
         plgpu.commit_smem()
-        plgpu.copy_smem_to_gmem(q_smem, out_ref.at[qs, hi])
+        plgpu.copy_smem_to_gmem(o_smem, out_ref.at[qs, hi])
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(jnp.logical_and(wg == _SCALE_WG, ub > lb))
@@ -678,6 +678,7 @@ def flash_attention_kernel(
 
           @pl.loop(0, num_tma_splits)
           def _scale_tma_chunk(i):
+            tma_chunk_size = head_dim_out // num_tma_splits
 
             @pl.loop(0, tma_chunk_size // block_d)
             def _scale_d(j):
@@ -710,7 +711,7 @@ def flash_attention_kernel(
             num_stages,
             num_tma_splits,
             block_kv // 2 if collective else block_kv,
-            tma_chunk_size,
+            head_dim // num_tma_splits,
         ),
         k.dtype,
     )
@@ -719,10 +720,12 @@ def flash_attention_kernel(
             num_stages,
             num_tma_splits,
             block_kv,
-            tma_chunk_size // 2 if collective else tma_chunk_size,
+            head_dim_out // num_tma_splits // (2 if collective else 1),
         ),
         k.dtype,
     )
+    o_scratch = tiled_smem((block_q, head_dim_out), q.dtype)
+
     qk_scratch = plgpu.TMEM(
         (block_q, block_kv * softmax_slots),
         q.dtype,
@@ -730,7 +733,7 @@ def flash_attention_kernel(
         collective=collective,
     )
     acc_scratch = plgpu.TMEM(
-        (block_q, head_dim), jnp.float32, collective=collective
+        (block_q, head_dim_out), jnp.float32, collective=collective
     )
 
     acc_qk_scratch = plgpu.TMEM(
@@ -781,7 +784,7 @@ def flash_attention_kernel(
     pl.run_scoped(
         lambda *args: kernel(*refs, scoped=args),
         (
-            q_scratch,
+            plgpu.RefUnion(q_scratch, o_scratch),
             k_scratch,
             v_scratch,
             qk_scratch,
